@@ -80,6 +80,17 @@ elif $CLOUD_MODE; then
   trap cleanup EXIT
 fi
 
+# ─── Load config ──────────────────────────────────────────────────────────
+# Config is always loaded (LOCAL_HOSTNAME used by local mode, R2/Pages by cloud)
+# Must be loaded before preflight so LOCAL_HOSTNAME is available for cert checks.
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+# Default LOCAL_HOSTNAME if not configured
+LOCAL_HOSTNAME="${LOCAL_HOSTNAME:-localhost}"
+
 # ─── Preflight ──────────────────────────────────────────────────────────────
 [[ -x /usr/libexec/PlistBuddy ]] || fail "PlistBuddy not found — this script requires macOS"
 
@@ -98,16 +109,6 @@ elif $TUNNEL_MODE; then
 else
   command -v wrangler >/dev/null 2>&1 || fail "wrangler not found. Install: npm i -g wrangler"
 fi
-
-# ─── Load config ──────────────────────────────────────────────────────────
-# Config is always loaded (LOCAL_HOSTNAME used by local mode, R2/Pages by cloud)
-if [[ -f "$CONFIG_FILE" ]]; then
-  # shellcheck source=/dev/null
-  source "$CONFIG_FILE"
-fi
-
-# Default LOCAL_HOSTNAME if not configured
-LOCAL_HOSTNAME="${LOCAL_HOSTNAME:-localhost}"
 
 if $CLOUD_MODE; then
   if [[ -z "${R2_BUCKET:-}" || -z "${R2_PUBLIC_URL:-}" || -z "${PAGES_PROJECT:-}" ]]; then
@@ -248,44 +249,40 @@ echo "  Version: $VERSION ($BUILD)"
 # ─── Step 2.5: Collect git changelog + release timestamp ──────────────────
 RELEASE_TIME="$(date '+%Y-%m-%d %H:%M:%S')"
 
-# Collect modified files from git (last tag to HEAD, or last 10 commits)
+# Collect uncommitted files + last 3 git commits
 CHANGED_FILES_HTML=""
 if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   log "Collecting git changelog..."
 
-  # Try to get changes since last tag; fall back to last 10 commits
-  LAST_TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo "")"
-  if [[ -n "$LAST_TAG" ]]; then
-    DIFF_REF="${LAST_TAG}..HEAD"
-    COMMIT_LOG="$(git log --oneline "$DIFF_REF" -- 2>/dev/null || echo "")"
-    FILE_LIST="$(git diff --name-only "$DIFF_REF" -- 2>/dev/null || echo "")"
-  else
-    DIFF_REF="HEAD~10..HEAD"
-    COMMIT_LOG="$(git log --oneline -10 2>/dev/null || echo "")"
-    FILE_LIST="$(git diff --name-only HEAD~10 HEAD -- 2>/dev/null || echo "")"
+  # Uncommitted files (staged + unstaged + untracked)
+  UNCOMMITTED="$(git status --short 2>/dev/null || echo "")"
+
+  # Last 3 commits
+  COMMIT_LOG="$(git log --oneline -3 2>/dev/null || echo "")"
+
+  CHANGED_FILES_HTML="<div class=\"changelog\"><h2>Changes in This Update</h2>"
+
+  # Uncommitted files section (shown above commits)
+  if [[ -n "$UNCOMMITTED" ]]; then
+    UNCOMMITTED_ITEMS=""
+    while IFS= read -r line; do
+      [[ -n "$line" ]] && UNCOMMITTED_ITEMS="${UNCOMMITTED_ITEMS}<li>${line}</li>"
+    done <<< "$UNCOMMITTED"
+    UNCOMMITTED_COUNT="$(echo "$UNCOMMITTED" | grep -c '.' || echo 0)"
+    CHANGED_FILES_HTML="${CHANGED_FILES_HTML}<h3>Uncommitted (${UNCOMMITTED_COUNT})</h3><ul class=\"files\">${UNCOMMITTED_ITEMS}</ul>"
+    ok "Found ${UNCOMMITTED_COUNT} uncommitted files"
   fi
 
-  # Build HTML for changed files
-  if [[ -n "$FILE_LIST" ]]; then
-    CHANGED_FILES_ITEMS=""
-    while IFS= read -r f; do
-      [[ -n "$f" ]] && CHANGED_FILES_ITEMS="${CHANGED_FILES_ITEMS}<li>${f}</li>"
-    done <<< "$FILE_LIST"
-
-    # Build commit summary
+  # Commits section
+  if [[ -n "$COMMIT_LOG" ]]; then
     COMMIT_ITEMS=""
     while IFS= read -r line; do
       [[ -n "$line" ]] && COMMIT_ITEMS="${COMMIT_ITEMS}<li>${line}</li>"
     done <<< "$COMMIT_LOG"
-
-    CHANGED_FILES_HTML="<div class=\"changelog\"><h2>Changes in This Update</h2>"
-    if [[ -n "$COMMIT_ITEMS" ]]; then
-      CHANGED_FILES_HTML="${CHANGED_FILES_HTML}<h3>Commits</h3><ul class=\"commits\">${COMMIT_ITEMS}</ul>"
-    fi
-    CHANGED_FILES_HTML="${CHANGED_FILES_HTML}<details><summary>Modified Files ($(echo "$FILE_LIST" | grep -c '.' || echo 0))</summary><ul class=\"files\">${CHANGED_FILES_ITEMS}</ul></details></div>"
-
-    ok "Found $(echo "$FILE_LIST" | grep -c '.' || echo 0) changed files"
+    CHANGED_FILES_HTML="${CHANGED_FILES_HTML}<h3>Recent Commits</h3><ul class=\"commits\">${COMMIT_ITEMS}</ul>"
   fi
+
+  CHANGED_FILES_HTML="${CHANGED_FILES_HTML}</div>"
 fi
 
 # ─── HTML generator function ───────────────────────────────────────────────
