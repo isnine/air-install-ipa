@@ -64,14 +64,55 @@ if ! $LOCAL_MODE && ! $TUNNEL_MODE && ! $CLOUD_MODE; then
   LOCAL_MODE=true
 fi
 
+# ─── State dir (singleton — kill previous deploy) ─────────────────────────
+STATE_DIR="$HOME/.config/air-install-ipa/state"
+mkdir -p "$STATE_DIR"
+PID_FILE="$STATE_DIR/server.pid"
+TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
+SERVE_DIR_FILE="$STATE_DIR/serve_dir"
+
+# Kill any previous deploy
+kill_previous() {
+  for pf in "$PID_FILE" "$TUNNEL_PID_FILE"; do
+    if [[ -f "$pf" ]]; then
+      local old_pid
+      old_pid="$(cat "$pf" 2>/dev/null || true)"
+      if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+        kill "$old_pid" 2>/dev/null || true
+        # Wait briefly for clean exit
+        for _ in 1 2 3; do
+          kill -0 "$old_pid" 2>/dev/null || break
+          sleep 0.3
+        done
+        kill -9 "$old_pid" 2>/dev/null || true
+      fi
+      rm -f "$pf"
+    fi
+  done
+  # Clean up old serve dir
+  if [[ -f "$SERVE_DIR_FILE" ]]; then
+    local old_dir
+    old_dir="$(cat "$SERVE_DIR_FILE" 2>/dev/null || true)"
+    [[ -n "$old_dir" && -d "$old_dir" ]] && rm -rf "$old_dir"
+    rm -f "$SERVE_DIR_FILE"
+  fi
+}
+
+kill_previous
+
 # ─── Cleanup ──────────────────────────────────────────────────────────────
 if $LOCAL_MODE || $TUNNEL_MODE; then
   # In local/tunnel mode, keep serving dir alive; clean up on exit
   TMPDIR_WORK="$(mktemp -d)"
   cleanup() {
-    [[ -n "${TUNNEL_PID:-}" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
-    [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
-    [[ -n "${TMPDIR_WORK:-}" ]] && rm -rf "$TMPDIR_WORK"
+    # Only kill server processes if running interactively (Ctrl+C)
+    # In non-interactive mode, server stays alive as a detached background process
+    if [[ -t 0 ]]; then
+      [[ -n "${TUNNEL_PID:-}" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
+      [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
+      rm -f "$PID_FILE" "$TUNNEL_PID_FILE" "$SERVE_DIR_FILE"
+      [[ -n "${TMPDIR_WORK:-}" ]] && rm -rf "$TMPDIR_WORK"
+    fi
   }
   trap cleanup EXIT INT TERM
 elif $CLOUD_MODE; then
@@ -544,18 +585,53 @@ MANIFEST
 
   generate_install_html "$MANIFEST_URL" "$CERT_BTN" "$GUIDE_HTML" > "$SERVE_DIR/index.html"
 
-  # Start HTTPS server with mkcert certs
+  # Auto-shutdown timeout (seconds): 30 min default, 3 min after IPA download
+  TIMEOUT_SECS="${AIR_INSTALL_TIMEOUT:-1800}"
+  DOWNLOAD_GRACE_SECS="${AIR_INSTALL_DOWNLOAD_GRACE:-180}"
+
+  # Start HTTPS server with mkcert certs + auto-shutdown logic
   log "Starting HTTPS server on ${LOCAL_HOSTNAME}:${LOCAL_PORT}..."
   python3 -c "
-import http.server, ssl, os, sys
+import http.server, ssl, os, sys, threading, time, signal
+
 os.chdir('$SERVE_DIR')
-handler = http.server.SimpleHTTPRequestHandler
-handler.extensions_map['.plist'] = 'application/xml'
-handler.extensions_map['.ipa'] = 'application/octet-stream'
+
+TIMEOUT = $TIMEOUT_SECS
+DOWNLOAD_GRACE = $DOWNLOAD_GRACE_SECS
+ipa_downloaded = threading.Event()
+shutdown_event = threading.Event()
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        '.plist': 'application/xml',
+        '.ipa': 'application/octet-stream',
+    }
+    def log_message(self, format, *args):
+        pass  # suppress request logs
+    def do_GET(self):
+        super().do_GET()
+        if self.path.endswith('.ipa'):
+            ipa_downloaded.set()
+
+def watchdog():
+    deadline = time.monotonic() + TIMEOUT
+    while not shutdown_event.is_set():
+        if ipa_downloaded.is_set():
+            # IPA was downloaded — wait grace period then shutdown
+            time.sleep(DOWNLOAD_GRACE)
+            break
+        if time.monotonic() >= deadline:
+            break
+        shutdown_event.wait(5)
+    os._exit(0)
+
+threading.Thread(target=watchdog, daemon=True).start()
+
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain('$CERT_FILE', '$KEY_FILE')
 try:
-    server = http.server.HTTPServer(('0.0.0.0', $LOCAL_PORT), handler)
+    server = http.server.HTTPServer(('0.0.0.0', $LOCAL_PORT), Handler)
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
     server.serve_forever()
 except OSError as e:
@@ -563,10 +639,13 @@ except OSError as e:
     sys.exit(1)
 " &
   SERVER_PID=$!
+  echo "$SERVER_PID" > "$PID_FILE"
+  echo "$SERVE_DIR" > "$SERVE_DIR_FILE"
   sleep 1
 
   # Verify server started
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$PID_FILE" "$SERVE_DIR_FILE"
     fail "HTTPS server failed to start on port $LOCAL_PORT"
   fi
 
@@ -582,11 +661,14 @@ except OSError as e:
   echo "    Settings → General → About → Certificate Trust Settings → Enable"
   echo ""
   echo "  CA cert: $(mkcert -CAROOT)/rootCA.pem"
-  echo "  Press Ctrl+C to stop the server."
+  echo "  Server PID: $SERVER_PID (auto-stops in ${TIMEOUT_SECS}s, or ${DOWNLOAD_GRACE_SECS}s after IPA download)"
+  echo "  Stop manually: kill $SERVER_PID"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  # Keep script alive until Ctrl+C
-  wait "$SERVER_PID" 2>/dev/null || true
+  # Interactive terminal: wait for Ctrl+C; non-interactive (e.g. Claude Code): exit immediately
+  if [[ -t 0 ]]; then
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
 
 elif $TUNNEL_MODE; then
   # ─── TUNNEL MODE: serve via cloudflared quick tunnel ─────────────────
@@ -603,26 +685,63 @@ elif $TUNNEL_MODE; then
     LOCAL_PORT=$((LOCAL_PORT + 1))
   done
 
-  # Start local HTTP server in background
+  # Auto-shutdown timeout (seconds): 30 min default, 3 min after IPA download
+  TIMEOUT_SECS="${AIR_INSTALL_TIMEOUT:-1800}"
+  DOWNLOAD_GRACE_SECS="${AIR_INSTALL_DOWNLOAD_GRACE:-180}"
+
+  # Start local HTTP server in background with auto-shutdown
   log "Starting local HTTP server on port $LOCAL_PORT..."
   python3 -c "
-import http.server, socketserver, os, sys
+import http.server, socketserver, os, sys, threading, time
+
 os.chdir('$SERVE_DIR')
-handler = http.server.SimpleHTTPRequestHandler
-handler.extensions_map['.plist'] = 'application/xml'
-handler.extensions_map['.ipa'] = 'application/octet-stream'
+
+TIMEOUT = $TIMEOUT_SECS
+DOWNLOAD_GRACE = $DOWNLOAD_GRACE_SECS
+ipa_downloaded = threading.Event()
+shutdown_event = threading.Event()
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        '.plist': 'application/xml',
+        '.ipa': 'application/octet-stream',
+    }
+    def log_message(self, format, *args):
+        pass
+    def do_GET(self):
+        super().do_GET()
+        if self.path.endswith('.ipa'):
+            ipa_downloaded.set()
+
+def watchdog():
+    deadline = time.monotonic() + TIMEOUT
+    while not shutdown_event.is_set():
+        if ipa_downloaded.is_set():
+            time.sleep(DOWNLOAD_GRACE)
+            break
+        if time.monotonic() >= deadline:
+            break
+        shutdown_event.wait(5)
+    os._exit(0)
+
+threading.Thread(target=watchdog, daemon=True).start()
+
 try:
-    with socketserver.TCPServer(('127.0.0.1', $LOCAL_PORT), handler) as s:
+    with socketserver.TCPServer(('127.0.0.1', $LOCAL_PORT), Handler) as s:
         s.serve_forever()
 except OSError as e:
     print(f'Server error: {e}', file=sys.stderr)
     sys.exit(1)
 " &
   SERVER_PID=$!
+  echo "$SERVER_PID" > "$PID_FILE"
+  echo "$SERVE_DIR" > "$SERVE_DIR_FILE"
   sleep 1
 
   # Verify server started
   if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    rm -f "$PID_FILE" "$SERVE_DIR_FILE"
     fail "Local HTTP server failed to start on port $LOCAL_PORT"
   fi
 
@@ -632,6 +751,7 @@ except OSError as e:
   cloudflared tunnel --url "http://127.0.0.1:$LOCAL_PORT" \
     --no-autoupdate --config /dev/null 2>"$TUNNEL_LOG" &
   TUNNEL_PID=$!
+  echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
 
   # Wait for cloudflared to print the public URL
   TUNNEL_URL=""
@@ -697,11 +817,15 @@ MANIFEST
   echo "  $TUNNEL_URL"
   echo ""
   echo "  Open this URL on your iPhone in Safari to install."
-  echo "  Press Ctrl+C to stop the tunnel."
+  echo "  Server PID: $SERVER_PID, Tunnel PID: $TUNNEL_PID"
+  echo "  Auto-stops in ${TIMEOUT_SECS}s, or ${DOWNLOAD_GRACE_SECS}s after IPA download"
+  echo "  Stop manually: kill $SERVER_PID $TUNNEL_PID"
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-  # Keep script alive until Ctrl+C
-  wait "$TUNNEL_PID" 2>/dev/null || true
+  # Interactive terminal: wait for Ctrl+C; non-interactive: exit immediately
+  if [[ -t 0 ]]; then
+    wait "$TUNNEL_PID" 2>/dev/null || true
+  fi
 
 elif $CLOUD_MODE; then
   # ─── CLOUD MODE: Upload to R2 + Pages (fixed URL, overwrites previous) ─
