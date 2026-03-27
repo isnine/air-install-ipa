@@ -157,7 +157,7 @@ elif [[ "$DEPLOY_MODE" == "cloud" ]]; then
     if wrangler r2 bucket list >/dev/null 2>&1; then
       ok "Authenticated via CLOUDFLARE_API_TOKEN."
     else
-      fail "CLOUDFLARE_API_TOKEN is set but appears invalid."
+      fail "CLOUDFLARE_API_TOKEN is set but appears invalid. Check that the token has the required permissions (see below)."
     fi
   else
     if [[ "$INTERACTIVE" == "true" ]]; then
@@ -168,7 +168,32 @@ elif [[ "$DEPLOY_MODE" == "cloud" ]]; then
       fi
       ok "Logged in to Cloudflare."
     else
-      fail "Not authenticated. Set CLOUDFLARE_API_TOKEN or run 'wrangler login' first."
+      echo ""
+      echo "  Cloudflare authentication required."
+      echo ""
+      echo "  Option A: Run 'wrangler login' in your terminal (opens browser)."
+      echo ""
+      echo "  Option B: Create an API token and set it as an environment variable:"
+      echo ""
+      echo "    1. Go to: https://dash.cloudflare.com/profile/api-tokens"
+      echo "    2. Click 'Create Token'"
+      echo "    3. Select 'Create Custom Token' at the bottom"
+      echo "    4. Configure the token with these permissions:"
+      echo "       - Account | Cloudflare Pages | Edit"
+      echo "       - Account | Workers R2 Storage  | Edit"
+      echo "    5. (Optional) Restrict to your specific account under 'Account Resources'"
+      echo "    6. Click 'Continue to summary' → 'Create Token'"
+      echo "    7. Copy the token value"
+      echo ""
+      echo "  Then set it in your shell profile (~/.zshrc or ~/.bashrc):"
+      echo ""
+      echo "    export CLOUDFLARE_API_TOKEN=\"your-token-here\""
+      echo ""
+      echo "  Or pass it inline:"
+      echo ""
+      echo "    CLOUDFLARE_API_TOKEN=\"your-token\" bash ~/.claude/skills/air-install-ipa/scripts/setup.sh --mode cloud"
+      echo ""
+      fail "Not authenticated. Follow the instructions above to set up Cloudflare access."
     fi
   fi
   echo ""

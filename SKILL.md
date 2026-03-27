@@ -21,11 +21,24 @@ Then run setup with the chosen mode:
 # Local mode
 bash ~/.claude/skills/air-install-ipa/scripts/setup.sh --mode local --hostname YOUR_HOSTNAME
 
-# Cloud mode
+# Cloud mode (requires Cloudflare auth — see below)
 bash ~/.claude/skills/air-install-ipa/scripts/setup.sh --mode cloud
 ```
 
 Setup saves `DEPLOY_MODE` to config. All future deploys use this mode automatically.
+
+### Cloud mode: Cloudflare authentication
+
+Cloud mode requires a Cloudflare account. If the user hasn't authenticated yet, setup will print instructions. There are two ways:
+
+1. **`wrangler login`** — the user runs this in their terminal (opens browser). Simplest option.
+2. **API Token** — for headless/CI use. The user creates a token at https://dash.cloudflare.com/profile/api-tokens with these permissions:
+   - Account / Cloudflare Pages / **Edit**
+   - Account / Workers R2 Storage / **Edit**
+
+   Then sets `export CLOUDFLARE_API_TOKEN="..."` in their shell profile.
+
+If setup fails due to auth, tell the user to follow the printed instructions and retry.
 
 ## Deploy
 
