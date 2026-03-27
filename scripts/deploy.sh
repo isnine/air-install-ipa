@@ -3,10 +3,11 @@ set -euo pipefail
 
 # ─── Air Install IPA — Deploy ──────────────────────────────────────────────
 # Build/deploy an Ad Hoc signed .ipa for OTA installation.
-# Three modes:
-#   (default)  Serve from this Mac via HTTPS (mkcert certs) on local network
-#   --tunnel   Serve from this Mac via cloudflared quick tunnel (no certs needed)
+# Two modes:
+#   --local    Serve from this Mac via HTTPS (mkcert certs) on local network
 #   --cloud    Upload to Cloudflare R2 + Pages
+# Default mode is read from DEPLOY_MODE in config. If not set, exits with
+# an error asking the user to run setup first.
 
 SKILL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG_FILE="$HOME/.config/air-install-ipa/config"
@@ -14,26 +15,23 @@ CONFIG_FILE="$HOME/.config/air-install-ipa/config"
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 usage() {
   cat <<'USAGE'
-Usage: deploy.sh [--tunnel | --cloud] [path/to/App.ipa]
+Usage: deploy.sh [--local | --cloud] [path/to/App.ipa]
 
 Deploys an Ad Hoc signed .ipa for OTA installation.
 
 Options:
-  (default)  Serve IPA from this Mac over HTTPS on the local network.
+  --local    Serve IPA from this Mac over HTTPS on the local network.
              Uses mkcert certificates for LOCAL_HOSTNAME (set in config).
-             Requires: mkcert certs + iPhone trusts the CA.
-             Press Ctrl+C to stop the server when done.
-
-  --tunnel   Serve IPA from this Mac via cloudflared quick tunnel.
-             No certs needed — uses trycloudflare.com HTTPS.
-             Press Ctrl+C to stop the tunnel when done.
+             Requires: iPhone on same network + trusts mkcert CA.
 
   --cloud    Upload to Cloudflare R2 + deploy install page to Pages.
+             Works from anywhere — no local network needed.
+             Requires: wrangler CLI + Cloudflare account.
 
-If no .ipa path is given, builds an Ad Hoc archive from the Xcode
-project in the current directory and exports the .ipa automatically.
+If no mode flag is given, uses DEPLOY_MODE from config.
+If no .ipa path is given, builds one from the current Xcode project.
 
-First-time (cloud mode)? Run setup first:
+First-time? Run setup first:
   bash ~/.claude/skills/air-install-ipa/scripts/setup.sh
 USAGE
   exit 1
@@ -45,13 +43,11 @@ ok()   { echo "✓ $*" >&2; }
 
 # ─── Parse flags ──────────────────────────────────────────────────────────
 LOCAL_MODE=false
-TUNNEL_MODE=false
 CLOUD_MODE=false
 POSITIONAL_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --local)   LOCAL_MODE=true ;;
-    --tunnel)  TUNNEL_MODE=true ;;
     --cloud)   CLOUD_MODE=true ;;
     --help|-h) usage ;;
     *)         POSITIONAL_ARGS+=("$arg") ;;
@@ -59,36 +55,41 @@ for arg in "$@"; do
 done
 set -- "${POSITIONAL_ARGS[@]+"${POSITIONAL_ARGS[@]}"}"
 
-# Default to local mode if no mode flag given
-if ! $LOCAL_MODE && ! $TUNNEL_MODE && ! $CLOUD_MODE; then
-  LOCAL_MODE=true
+# Default mode: from config DEPLOY_MODE, or fail if not configured
+if ! $LOCAL_MODE && ! $CLOUD_MODE; then
+  # Load config early to read DEPLOY_MODE
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+  fi
+  case "${DEPLOY_MODE:-}" in
+    local) LOCAL_MODE=true ;;
+    cloud) CLOUD_MODE=true ;;
+    *)     fail "No deploy mode configured. Run setup first: bash ~/.claude/skills/air-install-ipa/scripts/setup.sh" ;;
+  esac
 fi
 
 # ─── State dir (singleton — kill previous deploy) ─────────────────────────
 STATE_DIR="$HOME/.config/air-install-ipa/state"
 mkdir -p "$STATE_DIR"
 PID_FILE="$STATE_DIR/server.pid"
-TUNNEL_PID_FILE="$STATE_DIR/tunnel.pid"
 SERVE_DIR_FILE="$STATE_DIR/serve_dir"
 
 # Kill any previous deploy
 kill_previous() {
-  for pf in "$PID_FILE" "$TUNNEL_PID_FILE"; do
-    if [[ -f "$pf" ]]; then
-      local old_pid
-      old_pid="$(cat "$pf" 2>/dev/null || true)"
-      if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
-        kill "$old_pid" 2>/dev/null || true
-        # Wait briefly for clean exit
-        for _ in 1 2 3; do
-          kill -0 "$old_pid" 2>/dev/null || break
-          sleep 0.3
-        done
-        kill -9 "$old_pid" 2>/dev/null || true
-      fi
-      rm -f "$pf"
+  if [[ -f "$PID_FILE" ]]; then
+    local old_pid
+    old_pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill "$old_pid" 2>/dev/null || true
+      for _ in 1 2 3; do
+        kill -0 "$old_pid" 2>/dev/null || break
+        sleep 0.3
+      done
+      kill -9 "$old_pid" 2>/dev/null || true
     fi
-  done
+    rm -f "$PID_FILE"
+  fi
   # Clean up old serve dir
   if [[ -f "$SERVE_DIR_FILE" ]]; then
     local old_dir
@@ -101,16 +102,15 @@ kill_previous() {
 kill_previous
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────
-if $LOCAL_MODE || $TUNNEL_MODE; then
-  # In local/tunnel mode, keep serving dir alive; clean up on exit
+if $LOCAL_MODE; then
+  # In local mode, keep serving dir alive; clean up on exit
   TMPDIR_WORK="$(mktemp -d)"
   cleanup() {
     # Only kill server processes if running interactively (Ctrl+C)
     # In non-interactive mode, server stays alive as a detached background process
     if [[ -t 0 ]]; then
-      [[ -n "${TUNNEL_PID:-}" ]] && kill "$TUNNEL_PID" 2>/dev/null || true
       [[ -n "${SERVER_PID:-}" ]] && kill "$SERVER_PID" 2>/dev/null || true
-      rm -f "$PID_FILE" "$TUNNEL_PID_FILE" "$SERVE_DIR_FILE"
+      rm -f "$PID_FILE" "$SERVE_DIR_FILE"
       [[ -n "${TMPDIR_WORK:-}" ]] && rm -rf "$TMPDIR_WORK"
     fi
   }
@@ -122,8 +122,8 @@ elif $CLOUD_MODE; then
 fi
 
 # ─── Load config ──────────────────────────────────────────────────────────
-# Config is always loaded (LOCAL_HOSTNAME used by local mode, R2/Pages by cloud)
-# Must be loaded before preflight so LOCAL_HOSTNAME is available for cert checks.
+# Config may have been loaded already during mode resolution above.
+# Load again unconditionally to ensure all variables are available.
 if [[ -f "$CONFIG_FILE" ]]; then
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"
@@ -144,9 +144,6 @@ if $LOCAL_MODE; then
   if [[ -z "$CERT_FILE" || -z "$KEY_FILE" || ! -f "$CERT_FILE" || ! -f "$KEY_FILE" ]]; then
     fail "mkcert certs for '${LOCAL_HOSTNAME}' not found in $CERT_DIR. Run: mkdir -p $CERT_DIR && cd $CERT_DIR && mkcert ${LOCAL_HOSTNAME} localhost 127.0.0.1"
   fi
-elif $TUNNEL_MODE; then
-  command -v cloudflared >/dev/null 2>&1 || fail "cloudflared not found. Install: brew install cloudflared"
-  command -v python3 >/dev/null 2>&1 || fail "python3 not found"
 else
   command -v wrangler >/dev/null 2>&1 || fail "wrangler not found. Install: npm i -g wrangler"
 fi
@@ -668,163 +665,6 @@ except OSError as e:
   # Interactive terminal: wait for Ctrl+C; non-interactive (e.g. Claude Code): exit immediately
   if [[ -t 0 ]]; then
     wait "$SERVER_PID" 2>/dev/null || true
-  fi
-
-elif $TUNNEL_MODE; then
-  # ─── TUNNEL MODE: serve via cloudflared quick tunnel ─────────────────
-  SERVE_DIR="$TMPDIR_WORK/serve"
-  mkdir -p "$SERVE_DIR"
-
-  # Copy IPA into serve dir
-  cp "$IPA_PATH" "$SERVE_DIR/"
-  IPA_FILENAME="$(basename "$IPA_PATH")"
-
-  # Pick a local port (auto-increment if busy)
-  LOCAL_PORT=8723
-  while lsof -i :"$LOCAL_PORT" >/dev/null 2>&1; do
-    LOCAL_PORT=$((LOCAL_PORT + 1))
-  done
-
-  # Auto-shutdown timeout (seconds): 30 min default, 3 min after IPA download
-  TIMEOUT_SECS="${AIR_INSTALL_TIMEOUT:-1800}"
-  DOWNLOAD_GRACE_SECS="${AIR_INSTALL_DOWNLOAD_GRACE:-180}"
-
-  # Start local HTTP server in background with auto-shutdown
-  log "Starting local HTTP server on port $LOCAL_PORT..."
-  python3 -c "
-import http.server, socketserver, os, sys, threading, time
-
-os.chdir('$SERVE_DIR')
-
-TIMEOUT = $TIMEOUT_SECS
-DOWNLOAD_GRACE = $DOWNLOAD_GRACE_SECS
-ipa_downloaded = threading.Event()
-shutdown_event = threading.Event()
-
-class Handler(http.server.SimpleHTTPRequestHandler):
-    extensions_map = {
-        **http.server.SimpleHTTPRequestHandler.extensions_map,
-        '.plist': 'application/xml',
-        '.ipa': 'application/octet-stream',
-    }
-    def log_message(self, format, *args):
-        pass
-    def do_GET(self):
-        super().do_GET()
-        if self.path.endswith('.ipa'):
-            ipa_downloaded.set()
-
-def watchdog():
-    deadline = time.monotonic() + TIMEOUT
-    while not shutdown_event.is_set():
-        if ipa_downloaded.is_set():
-            time.sleep(DOWNLOAD_GRACE)
-            break
-        if time.monotonic() >= deadline:
-            break
-        shutdown_event.wait(5)
-    os._exit(0)
-
-threading.Thread(target=watchdog, daemon=True).start()
-
-try:
-    with socketserver.TCPServer(('127.0.0.1', $LOCAL_PORT), Handler) as s:
-        s.serve_forever()
-except OSError as e:
-    print(f'Server error: {e}', file=sys.stderr)
-    sys.exit(1)
-" &
-  SERVER_PID=$!
-  echo "$SERVER_PID" > "$PID_FILE"
-  echo "$SERVE_DIR" > "$SERVE_DIR_FILE"
-  sleep 1
-
-  # Verify server started
-  if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-    rm -f "$PID_FILE" "$SERVE_DIR_FILE"
-    fail "Local HTTP server failed to start on port $LOCAL_PORT"
-  fi
-
-  # Start cloudflared quick tunnel in background, capture the URL
-  log "Starting cloudflared tunnel..."
-  TUNNEL_LOG="$TMPDIR_WORK/tunnel.log"
-  cloudflared tunnel --url "http://127.0.0.1:$LOCAL_PORT" \
-    --no-autoupdate --config /dev/null 2>"$TUNNEL_LOG" &
-  TUNNEL_PID=$!
-  echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
-
-  # Wait for cloudflared to print the public URL
-  TUNNEL_URL=""
-  for i in $(seq 1 30); do
-    TUNNEL_URL="$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" 2>/dev/null | head -1 || true)"
-    if [[ -n "$TUNNEL_URL" ]]; then
-      break
-    fi
-    sleep 1
-  done
-
-  if [[ -z "$TUNNEL_URL" ]]; then
-    cat "$TUNNEL_LOG" >&2
-    fail "cloudflared failed to create tunnel within 30s"
-  fi
-
-  ok "Tunnel active: $TUNNEL_URL"
-
-  IPA_URL="${TUNNEL_URL}/${IPA_FILENAME}"
-
-  # Generate manifest.plist (IPA URL points to tunnel)
-  cat > "$SERVE_DIR/manifest.plist" <<MANIFEST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>items</key>
-  <array>
-    <dict>
-      <key>assets</key>
-      <array>
-        <dict>
-          <key>kind</key>
-          <string>software-package</string>
-          <key>url</key>
-          <string>${IPA_URL}</string>
-        </dict>
-      </array>
-      <key>metadata</key>
-      <dict>
-        <key>bundle-identifier</key>
-        <string>${BUNDLE_ID}</string>
-        <key>bundle-version</key>
-        <string>${VERSION}</string>
-        <key>kind</key>
-        <string>software</string>
-        <key>title</key>
-        <string>${APP_TITLE}</string>
-      </dict>
-    </dict>
-  </array>
-</dict>
-</plist>
-MANIFEST
-
-  # Generate install page
-  generate_install_html "${TUNNEL_URL}/manifest.plist" "" "" > "$SERVE_DIR/index.html"
-
-  # ─── Done (tunnel) ──────────────────────────────────────────────────────
-  echo ""
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  ok "Tunnel server ready! Install URL:"
-  echo "  $TUNNEL_URL"
-  echo ""
-  echo "  Open this URL on your iPhone in Safari to install."
-  echo "  Server PID: $SERVER_PID, Tunnel PID: $TUNNEL_PID"
-  echo "  Auto-stops in ${TIMEOUT_SECS}s, or ${DOWNLOAD_GRACE_SECS}s after IPA download"
-  echo "  Stop manually: kill $SERVER_PID $TUNNEL_PID"
-  echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-  # Interactive terminal: wait for Ctrl+C; non-interactive: exit immediately
-  if [[ -t 0 ]]; then
-    wait "$TUNNEL_PID" 2>/dev/null || true
   fi
 
 elif $CLOUD_MODE; then
